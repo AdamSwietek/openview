@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openview"
+version = "0.1.0"
+description = "Visibility and view simulation toolkit for urban terrain and buildings."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+  {name = "OpenView Contributors"},
+]
+dependencies = [
+  "numpy",
+  "pandas",
+  "geopandas",
+  "shapely",
+  "rioxarray",
+  "rasterio",
+  "xarray",
+  "pyvista",
+  "point-cloud-utils",
+  "osmnx",
+  "seamless-3dep",
+  "py3dep",
+  "tqdm",
+  "boto3",
+  "scikit-learn",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
