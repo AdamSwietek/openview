@@ -11,7 +11,7 @@ from shapely.geometry import Polygon, MultiPolygon
 def elevate_footprints(
     buildings: gpd.GeoDataFrame,
     dem: xr.DataArray,
-    HEIGHT_OFFSET: float = 2.0, #(meter) TODO: problem from terrain reduction after this, temp hardcore offset, find better solution
+    HEIGHT_OFFSET: float = 0.0,
 ) -> gpd.GeoDataFrame:
     """Sample DEM elevation at each building centroid and add Z to geometry.
 
@@ -34,10 +34,14 @@ def elevate_footprints(
     xs = centroids.x.to_numpy()
     ys = centroids.y.to_numpy()
 
-    # Vectorised nearest-neighbour sampling
-    x_da = xr.DataArray(xs, dims="points")
-    y_da = xr.DataArray(ys, dims="points")
-    elevations = dem.sel(x=x_da, y=y_da, method="nearest").values.flatten()
+    # Bilinear interpolation — matches RegularGridInterpolator used in extrude_buildings
+    from scipy.interpolate import RegularGridInterpolator
+    dem_s = dem.sortby("y")
+    rgi = RegularGridInterpolator(
+        (dem_s["y"].values, dem_s["x"].values), dem_s.values,
+        method="linear", bounds_error=False, fill_value=None,
+    )
+    elevations = rgi(np.column_stack([ys, xs]))
 
     buildings["elevation"] = elevations + HEIGHT_OFFSET
 

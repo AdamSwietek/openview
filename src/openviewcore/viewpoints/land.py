@@ -166,6 +166,7 @@ def generate_land_viewpoints(
                     (x, y, z),
                     tuple(d_vec),
                     grid_spacing,
+                    0.0,         # patch_area not applicable for land viewpoints
                 ))
         cell_idx += 1
 

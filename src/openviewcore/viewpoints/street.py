@@ -202,18 +202,19 @@ def generate_street_viewpoints(
             # Two viewpoints: forward and backward along the road
             for sign in (1.0, -1.0):
                 records.append({
-                    "vp_uuid":     0,                         # filled below
+                    "vp_uuid":     0,
                     "osmid":       osmid,
                     "vp":          [x, y, 0.0],               # Z filled below
                     "norm":        [sign * nx, sign * ny, 0.0],
                     "segment_len": edge_len,
+                    "patch_area":  0.0,
                 })
 
     if not records:
         return np.empty(0, dtype=VP_DTYPE)
 
     arr = np.array(
-        [(d["vp_uuid"], d["osmid"], d["vp"], d["norm"], d["segment_len"])
+        [(d["vp_uuid"], d["osmid"], d["vp"], d["norm"], d["segment_len"], d["patch_area"])
          for d in records],
         dtype=VP_DTYPE,
     )

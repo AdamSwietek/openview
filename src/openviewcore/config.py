@@ -30,7 +30,7 @@ DEFAULT_PROJECT_CRS: str = os.getenv("OPENVIEWCORE_CRS", "EPSG:6424")
 # ---------------------------------------------------------------------------
 DEFAULT_FLOOR_HEIGHT: float = 3.0       # meters per storey
 DEFAULT_GROUND_FLOOR_H: float = 2.0     # height of first viewpoint row
-DEFAULT_FACADE_OFFSET: float = 0.5      # push viewpoint away from wall (m)
+DEFAULT_FACADE_OFFSET: float = 0.1      # push viewpoint away from wall (m)
 DEFAULT_MIN_SEGMENT_LEN: float = 1.0    # skip facade edges shorter than this
 
 # ---------------------------------------------------------------------------
@@ -38,7 +38,7 @@ DEFAULT_MIN_SEGMENT_LEN: float = 1.0    # skip facade edges shorter than this
 # ---------------------------------------------------------------------------
 DEFAULT_RAY_HFOV: float = 60.0          # half field‑of‑view (degrees)
 DEFAULT_RAY_RESOLUTION: int = 25        # grid cells per side
-DEFAULT_RAY_NEAR: float = .5         # ignore hits closer than this (m)
+DEFAULT_RAY_NEAR: float = .1         # ignore hits closer than this (m)
 DEFAULT_CHUNK_SIZE: int = 5000          # viewpoints per chunk
 
 # ---------------------------------------------------------------------------

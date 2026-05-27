@@ -36,6 +36,7 @@ VP_DTYPE = np.dtype([
     ("vp", np.float64, (3,)),
     ("norm", np.float64, (3,)),
     ("segment_len", np.float64),
+    ("patch_area", np.float64),
 ])
 
 
@@ -133,11 +134,12 @@ def _viewpoints_for_building(item: dict) -> list[dict]:
                 elevation + h,
             ]
             viewpoints.append({
-                "vp_uuid": 0, #placeholder
+                "vp_uuid": 0,
                 "osmid": osmid,
                 "vp": vp,
                 "norm": [normal[0], normal[1], 0.0],
                 "segment_len": seg_len,
+                "patch_area": seg_len * floor_h,
             })
 
     return viewpoints
@@ -187,12 +189,12 @@ def _filter_subterrain(viewpoints: np.ndarray, terrain_mesh: dict) -> np.ndarray
       fid <  0  ->  no hit                   ->  viewpoint is sub-terrain   ->  discard
     """
     import point_cloud_utils as pcu
-
+    
     vp_o = np.ascontiguousarray(viewpoints["vp"], dtype=np.float32)
 
     # Start 2 m below each viewpoint eliminate low ground clearnance pts 
     vp_o_up = vp_o.copy()
-    vp_o_up[:, 2] = vp_o[:, 2] - 2.0
+    vp_o_up[:, 2] = vp_o[:, 2] - .5
 
     ray_d = np.ascontiguousarray(
         np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float32), (len(vp_o), 1)),
@@ -223,7 +225,7 @@ def _row_to_dict(row, params: dict) -> dict:
 def _to_structured_array(results: list[list[dict]]) -> np.ndarray:
     flat = [item for sublist in results if sublist for item in sublist]
     arr = np.array(
-        [(d["vp_uuid"], d["osmid"], d["vp"], d["norm"], d["segment_len"])
+        [(d["vp_uuid"], d["osmid"], d["vp"], d["norm"], d["segment_len"], d["patch_area"])
          for d in flat],
         dtype=VP_DTYPE,
     )
