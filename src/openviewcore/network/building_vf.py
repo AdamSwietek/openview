@@ -601,6 +601,7 @@ def _reduce_partitions(out, dirs, cfg):
                 FROM directed GROUP BY building_id
             )
             SELECT p.building_id, p.perimeter_m,
+                   p.perimeter_m * COALESCE(m.bvf_all_edges, 0) AS exchange_total_m,
                    COALESCE(m.neighbor_count, 0) AS neighbor_count,
                    COALESCE(m.bvf_all_edges, 0) AS bvf_all_edges,
                    COALESCE(m.bvf_noncontact_edges, 0) AS bvf_noncontact_edges,

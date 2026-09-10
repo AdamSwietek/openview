@@ -53,6 +53,10 @@ def test_two_tile_graph_has_visible_and_contact_edges(tmp_path):
     assert (edges["f_max_i_to_j"] >= edges["vf_i_to_j"]).all()
     assert (edges["f_max_j_to_i"] >= edges["vf_j_to_i"]).all()
     assert ids.loc[1, "source_building_id"] == "A"
+    assert np.allclose(
+        metrics["exchange_total_m"],
+        metrics["perimeter_m"] * metrics["bvf_all_edges"],
+    )
     assert metrics["bvf_all_edges"].between(0, 1 + 1e-12).all()
     assert metrics["bvf_max"].between(0, 1).all()
     assert metrics.set_index("building_id").loc[2, "bvf_max"] == pytest.approx(1.0)
