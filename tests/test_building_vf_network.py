@@ -4,7 +4,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import box
+from shapely.affinity import translate
+from shapely.geometry import MultiPolygon, box
 
 pytest.importorskip("duckdb")
 pytest.importorskip("pyarrow")
@@ -12,7 +13,8 @@ pytest.importorskip("pyarrow")
 from openviewcore.network import BVFGraphConfig, build_bvf_graph
 
 
-def test_two_tile_graph_has_visible_and_contact_edges(tmp_path):
+@pytest.mark.parametrize("visibility_backend", ["strtree", "bvh"])
+def test_two_tile_graph_has_visible_and_contact_edges(tmp_path, visibility_backend):
     buildings = gpd.GeoDataFrame(
         {
             "OBJECTID": [1, 2, 3],
@@ -30,6 +32,7 @@ def test_two_tile_graph_has_visible_and_contact_edges(tmp_path):
         min_edge_length_m=1,
         workers=1,
         resume=False,
+        visibility_backend=visibility_backend,
     )
 
     result = build_bvf_graph(
@@ -75,3 +78,61 @@ def test_two_tile_graph_has_visible_and_contact_edges(tmp_path):
         - metrics["bvf_noncontact_edges"]
         - metrics["bvf_contact_edges"]
     ).abs().max() < 1e-12
+
+
+@pytest.mark.parametrize("visibility_backend", ["strtree", "bvh"])
+def test_selection_mask_limits_nodes_but_retains_external_blockers(
+    tmp_path, visibility_backend,
+):
+    a = box(2, 4, 8, 12)
+    blocker = box(10, 2, 14, 14)
+    c = box(16, 4, 22, 12)
+    buildings = gpd.GeoDataFrame(
+        {"OBJECTID": [1, 2, 3], "BLD_ID": ["A", "blocker", "C"]},
+        geometry=[a, blocker, c], crs="EPSG:32611",
+    )
+    selection = MultiPolygon([a.buffer(0.1), c.buffer(0.1)])
+    config = BVFGraphConfig(
+        id_column="OBJECTID", source_id_column="BLD_ID",
+        target_crs="EPSG:32611", tile_size_m=20, max_distance_m=30,
+        min_edge_length_m=1, workers=1, resume=False,
+        visibility_backend=visibility_backend,
+    )
+
+    result = build_bvf_graph(
+        buildings, tmp_path / "selected_graph", config=config,
+        selection_mask=selection,
+    )
+
+    ids = pd.read_parquet(result.building_ids_path)
+    edges = pd.read_parquet(result.building_edges_path)
+    assert set(ids["building_id"]) == {1, 3}
+    assert edges.empty
+
+
+def test_bvh_visibility_is_stable_at_large_projected_coordinates(tmp_path):
+    footprints = [
+        translate(box(2, 4, 8, 12), xoff=384_000, yoff=3_768_000),
+        translate(box(10, 2, 14, 14), xoff=384_000, yoff=3_768_000),
+        translate(box(16, 4, 22, 12), xoff=384_000, yoff=3_768_000),
+    ]
+    buildings = gpd.GeoDataFrame(
+        {"OBJECTID": [1, 2, 3], "BLD_ID": ["A", "blocker", "C"]},
+        geometry=footprints, crs="EPSG:26911",
+    )
+    selection = MultiPolygon([
+        footprints[0].buffer(0.1), footprints[2].buffer(0.1),
+    ])
+    config = BVFGraphConfig(
+        id_column="OBJECTID", source_id_column="BLD_ID",
+        target_crs="EPSG:26911", tile_size_m=2_000,
+        max_distance_m=30, min_edge_length_m=1, workers=1,
+        resume=False, visibility_backend="bvh",
+    )
+
+    result = build_bvf_graph(
+        buildings, tmp_path / "large_coordinates", config=config,
+        selection_mask=selection,
+    )
+
+    assert pd.read_parquet(result.building_edges_path).empty

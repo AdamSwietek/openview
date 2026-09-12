@@ -21,6 +21,7 @@ import shapely
 from pyproj import CRS, Transformer
 from scipy.spatial import cKDTree
 from shapely import STRtree
+from tqdm.auto import tqdm
 
 
 PATCH_STRIDE = 100_000
@@ -69,6 +70,9 @@ class BVFGraphConfig:
     min_edge_length_m: float = 2.0
     min_crossing_m: float = 0.25
     contact_tolerance_m: float = 0.05
+    visibility_backend: str = "strtree"
+    ray_offset_m: float = 0.01
+    hit_tolerance_m: float = 0.005
     query_batch_size: int = 500
     workers: int = 1
     resume: bool = True
@@ -104,6 +108,7 @@ def build_bvf_graph(
     config: Optional[BVFGraphConfig] = None,
     bounds: Optional[tuple[float, float, float, float]] = None,
     max_tiles: Optional[int] = None,
+    selection_mask=None,
 ) -> BVFGraphResult:
     """Build a tiled 2D building graph and return paths to its products.
 
@@ -119,6 +124,11 @@ def build_bvf_graph(
         Optional processing bounds in ``config.target_crs``.
     max_tiles
         Optional development limit. Use with ``bounds`` for deterministic tests.
+    selection_mask
+        Optional geometry, GeoSeries, or GeoDataFrame selecting graph nodes.
+        Geospatial objects are reprojected to ``config.target_crs``. A bare
+        Shapely geometry is assumed to already use that CRS. Unselected nearby
+        buildings remain available as visibility blockers.
     """
     cfg = config or BVFGraphConfig()
     out = Path(output_dir)
@@ -127,8 +137,11 @@ def build_bvf_graph(
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
 
-    source = _source_spec(buildings, cfg, bounds)
+    source = _source_spec(buildings, cfg, bounds, selection_mask)
     tiles = list(_iter_tiles(source["target_bounds"], cfg.tile_size_m))
+    if source["selection_mask_wkb"] is not None:
+        mask = shapely.from_wkb(source["selection_mask_wkb"])
+        tiles = [tile for tile in tiles if shapely.intersects(shapely.box(*tile.bounds), mask)]
     if max_tiles is not None:
         tiles = tiles[:max_tiles]
     if not tiles:
@@ -140,14 +153,31 @@ def build_bvf_graph(
         for tile in tiles
         if not (cfg.resume and (dirs["done"] / f"{tile.key}.json").exists())
     ]
-    if cfg.workers > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=cfg.workers) as pool:
-            futures = [pool.submit(_process_tile, *job) for job in jobs]
-            for future in as_completed(futures):
-                future.result()
-    else:
-        for job in jobs:
-            _process_tile(*job)
+    completed = len(tiles) - len(jobs)
+    with tqdm(
+        total=len(tiles), initial=completed, desc="2D BVF tiles", unit="tile",
+        dynamic_ncols=True,
+    ) as tile_progress:
+        if cfg.workers > 1 and len(jobs) > 1:
+            with ProcessPoolExecutor(max_workers=cfg.workers) as pool:
+                futures = {
+                    pool.submit(_process_tile, *job, False): job[2].key for job in jobs
+                }
+                for future in as_completed(futures):
+                    status = future.result()
+                    tile_progress.set_postfix(
+                        tile=status["tile"], patches=status["patches_owned"],
+                        edges=status["raw_edges"], refresh=False,
+                    )
+                    tile_progress.update()
+        else:
+            for job in jobs:
+                status = _process_tile(*job, True)
+                tile_progress.set_postfix(
+                    tile=status["tile"], patches=status["patches_owned"],
+                    edges=status["raw_edges"], refresh=False,
+                )
+                tile_progress.update()
 
     result = _reduce_partitions(out, dirs, cfg)
     manifest = {
@@ -156,6 +186,7 @@ def build_bvf_graph(
         "input": str(buildings) if not isinstance(buildings, gpd.GeoDataFrame) else "GeoDataFrame",
         "config": asdict(cfg),
         "bounds": list(source["target_bounds"]),
+        "selection_mask_applied": source["selection_mask_wkb"] is not None,
         "tile_count": len(tiles),
         "outputs": {name: str(path) for name, path in asdict(result).items()},
     }
@@ -173,7 +204,7 @@ def _output_dirs(out: Path) -> dict[str, Path]:
     }
 
 
-def _source_spec(buildings, cfg: BVFGraphConfig, bounds):
+def _source_spec(buildings, cfg: BVFGraphConfig, bounds, selection_mask=None):
     if isinstance(buildings, gpd.GeoDataFrame):
         if buildings.crs is None:
             raise ValueError("Input buildings must have a CRS.")
@@ -186,10 +217,34 @@ def _source_spec(buildings, cfg: BVFGraphConfig, bounds):
         source_crs = info["crs"]
         source_bounds = tuple(map(float, info["total_bounds"]))
     transformer = Transformer.from_crs(source_crs, cfg.target_crs, always_xy=True)
-    target_bounds = transformer.transform_bounds(*source_bounds, densify_pts=21)
+    source_target_bounds = transformer.transform_bounds(*source_bounds, densify_pts=21)
+    analysis_extent = shapely.box(*source_target_bounds)
+    mask_geometry = None
+    if selection_mask is not None:
+        if isinstance(selection_mask, gpd.GeoDataFrame):
+            mask_geometry = selection_mask.to_crs(cfg.target_crs).geometry.union_all()
+        elif isinstance(selection_mask, gpd.GeoSeries):
+            mask_geometry = selection_mask.to_crs(cfg.target_crs).union_all()
+        else:
+            mask_geometry = selection_mask
+        mask_geometry = shapely.make_valid(mask_geometry)
+        if mask_geometry is None or mask_geometry.is_empty:
+            raise ValueError("selection_mask is empty.")
+        analysis_extent = shapely.intersection(
+            analysis_extent, shapely.box(*mask_geometry.bounds)
+        )
+        if analysis_extent.is_empty:
+            raise ValueError("selection_mask does not overlap the building source.")
+    if bounds is not None:
+        requested = shapely.box(*bounds)
+        analysis_extent = shapely.intersection(analysis_extent, requested)
+        if analysis_extent.is_empty:
+            raise ValueError("bounds do not overlap the selected building extent.")
+    target_bounds = tuple(map(float, analysis_extent.bounds))
     return {
         "source_crs": source_crs,
-        "target_bounds": tuple(map(float, bounds or target_bounds)),
+        "target_bounds": tuple(map(float, target_bounds)),
+        "selection_mask_wkb": shapely.to_wkb(mask_geometry) if mask_geometry is not None else None,
     }
 
 
@@ -223,6 +278,8 @@ def _read_tile_buildings(buildings, source, tile, cfg):
             fid_as_index=fid_id,
         ).to_crs(cfg.target_crs)
     if data.empty:
+        data["node_id"] = pd.Series(dtype="int64")
+        data["selected"] = pd.Series(dtype="bool")
         return data
     if cfg.id_column in data:
         raw_node_id = data[cfg.id_column]
@@ -236,6 +293,11 @@ def _read_tile_buildings(buildings, source, tile, cfg):
     data = data.assign(node_id=node_id)
     data.geometry = shapely.make_valid(data.geometry.to_numpy())
     data = data[data.geometry.notna() & ~data.geometry.is_empty].copy()
+    if source["selection_mask_wkb"] is None:
+        data["selected"] = True
+    else:
+        mask = shapely.from_wkb(source["selection_mask_wkb"])
+        data["selected"] = shapely.intersects(data.geometry.to_numpy(), mask)
     return data
 
 
@@ -302,6 +364,10 @@ def _contact_rows(patches, buildings, tile, cfg):
     contacts = contacts[contacts["building_id"] != contacts["receiver_building"]]
     contacts = contacts.drop_duplicates(["patch_id", "receiver_building"])
     all_contact_ids = contacts["patch_id"].unique().astype(np.int64)
+    selected_receivers = set(
+        buildings.loc[buildings["selected"], "node_id"].astype(np.int64)
+    )
+    contacts = contacts[contacts["receiver_building"].isin(selected_receivers)]
     owned = (patches["home_ix"] == tile.ix) & (patches["home_iy"] == tile.iy)
     owned_ids = set(patches.loc[owned, "patch_id"].astype(np.int64))
     contacts = contacts[contacts["patch_id"].isin(owned_ids)].copy()
@@ -316,13 +382,19 @@ def _contact_rows(patches, buildings, tile, cfg):
     return contacts[list(_empty_contacts().columns)].reset_index(drop=True), all_contact_ids
 
 
-def _candidate_pairs(patches, cfg):
+def _candidate_pairs(patches, cfg, progress_desc=None):
     xy = patches[["x_m", "y_m"]].to_numpy(dtype=float)
     normals = patches[["nx", "ny"]].to_numpy(dtype=float)
     building = patches["building_id"].to_numpy(dtype=np.int64)
     tree = cKDTree(xy)
     cutoff = np.cos(np.deg2rad(cfg.max_angle_deg))
-    for start in range(0, len(patches), cfg.query_batch_size):
+    starts = range(0, len(patches), cfg.query_batch_size)
+    if progress_desc:
+        starts = tqdm(
+            starts, total=math.ceil(len(patches) / cfg.query_batch_size),
+            desc=progress_desc, unit="batch", leave=False, dynamic_ncols=True,
+        )
+    for start in starts:
         neighborhoods = tree.query_ball_point(
             xy[start:start + cfg.query_batch_size], cfg.max_distance_m, workers=1,
         )
@@ -366,7 +438,78 @@ def _visible_mask(p, q, patches, geometry, tree, min_crossing):
     return ~blocked
 
 
-def _patch_exchange(patches, buildings, tile, allowed_tiles, contact_ids, cfg):
+def _curtain_mesh(buildings, local_origin):
+    """Build a unit-height triangle curtain from 2D footprint boundaries.
+
+    Coordinates are translated before conversion to float32.  This is
+    important for projected CRSs such as UTM, where absolute coordinates are
+    too large to retain centimetre-scale offsets in float32.
+    """
+    ox, oy = local_origin
+    vertices = []
+    faces = []
+    face_building = []
+    for row in buildings[["node_id", "geometry"]].itertuples(index=False):
+        for polygon in _polygon_parts(row.geometry):
+            for ring in (polygon.exterior, *polygon.interiors):
+                coords = np.asarray(ring.coords, dtype=float)[:, :2]
+                for a, b in zip(coords[:-1], coords[1:]):
+                    if np.linalg.norm(b - a) <= 1e-12:
+                        continue
+                    base = len(vertices)
+                    ax, ay = a[0] - ox, a[1] - oy
+                    bx, by = b[0] - ox, b[1] - oy
+                    vertices.extend([
+                        (ax, ay, -1.0), (bx, by, -1.0),
+                        (bx, by, 1.0), (ax, ay, 1.0),
+                    ])
+                    faces.extend([
+                        (base, base + 1, base + 2),
+                        (base, base + 2, base + 3),
+                    ])
+                    face_building.extend([row.node_id, row.node_id])
+    return {
+        "v": np.ascontiguousarray(vertices, dtype=np.float32).reshape(-1, 3),
+        "f": np.ascontiguousarray(faces, dtype=np.int32).reshape(-1, 3),
+        "face_building": np.asarray(face_building, dtype=np.int64),
+        "local_origin": np.asarray(local_origin, dtype=float),
+    }
+
+
+def _visible_mask_bvh(p, q, patches, intersector, local_origin, cfg):
+    """Return visibility using the first hit on a 2D footprint curtain BVH."""
+    xy = patches[["x_m", "y_m"]].to_numpy(dtype=float)
+    normals = patches[["nx", "ny"]].to_numpy(dtype=float)
+    origin_xy = xy[p] + cfg.ray_offset_m * normals[p] - local_origin
+    target_xy = xy[q] + cfg.ray_offset_m * normals[q] - local_origin
+    displacement_xy = target_xy - origin_xy
+    distance = np.linalg.norm(displacement_xy, axis=1)
+    valid = distance > 1e-9
+    origins = np.column_stack([origin_xy, np.zeros(len(p))]).astype(np.float32)
+    directions = np.zeros((len(p), 3), dtype=np.float32)
+    directions[valid, :2] = (
+        displacement_xy[valid] / distance[valid, None]
+    ).astype(np.float32)
+    # Invalid zero-length rays are never expected after candidate filtering;
+    # keep their direction finite and classify them as not visible.
+    directions[~valid, 0] = 1.0
+    face_id, _, hit_t = intersector.intersect_rays(
+        np.ascontiguousarray(origins),
+        np.ascontiguousarray(directions),
+        ray_near=max(cfg.hit_tolerance_m, 1e-6),
+        ray_far=float(np.max(distance) + cfg.hit_tolerance_m),
+    )
+    hit_t = np.asarray(hit_t).reshape(-1)
+    face_id = np.asarray(face_id).reshape(-1)
+    return valid & (
+        (face_id < 0) | (hit_t >= distance - cfg.hit_tolerance_m)
+    )
+
+
+def _patch_exchange(
+    patches, buildings, tile, allowed_tiles, contact_ids, cfg,
+    show_progress=False,
+):
     if patches.empty:
         return _empty_exchange()
     ids = patches["patch_id"].to_numpy(dtype=np.int64)
@@ -376,9 +519,31 @@ def _patch_exchange(patches, buildings, tile, allowed_tiles, contact_ids, cfg):
     length = patches["length_m"].to_numpy(dtype=float)
     contact = np.isin(ids, contact_ids)
     geometry = buildings.geometry.to_numpy()
-    footprint_tree = STRtree(geometry)
+    footprint_tree = None
+    curtain_intersector = None
+    local_origin = np.asarray(tile.bounds[:2], dtype=float)
+    if cfg.visibility_backend == "strtree":
+        footprint_tree = STRtree(geometry)
+    elif cfg.visibility_backend == "bvh":
+        import point_cloud_utils as pcu
+
+        curtain = _curtain_mesh(buildings, local_origin)
+        if len(curtain["f"]):
+            curtain_intersector = pcu.RayMeshIntersector(
+                curtain["v"], curtain["f"],
+            )
+    else:
+        raise ValueError(
+            "visibility_backend must be either 'strtree' or 'bvh'."
+        )
     chunks = []
-    for p, q, distance, cos_p, cos_q in _candidate_pairs(patches, cfg):
+    progress_desc = (
+        f"tile {tile.key}: {len(patches):,} facade patches"
+        if show_progress else None
+    )
+    for p, q, distance, cos_p, cos_q in _candidate_pairs(
+        patches, cfg, progress_desc=progress_desc,
+    ):
         canonical = np.where(ids[p] < ids[q], p, q)
         owned = (home_ix[canonical] == tile.ix) & (home_iy[canonical] == tile.iy)
         included = np.fromiter(
@@ -391,9 +556,18 @@ def _patch_exchange(patches, buildings, tile, allowed_tiles, contact_ids, cfg):
         distance, cos_p, cos_q = distance[keep], cos_p[keep], cos_q[keep]
         if not len(p):
             continue
-        visible = _visible_mask(
-            p, q, patches, geometry, footprint_tree, cfg.min_crossing_m,
-        )
+        if cfg.visibility_backend == "bvh":
+            visible = (
+                np.ones(len(p), dtype=bool)
+                if curtain_intersector is None
+                else _visible_mask_bvh(
+                    p, q, patches, curtain_intersector, local_origin, cfg,
+                )
+            )
+        else:
+            visible = _visible_mask(
+                p, q, patches, geometry, footprint_tree, cfg.min_crossing_m,
+            )
         p, q = p[visible], q[visible]
         distance, cos_p, cos_q = distance[visible], cos_p[visible], cos_q[visible]
         if not len(p):
@@ -411,14 +585,15 @@ def _patch_exchange(patches, buildings, tile, allowed_tiles, contact_ids, cfg):
     return pd.concat(chunks, ignore_index=True) if chunks else _empty_exchange()
 
 
-def _process_tile(buildings, source, tile, allowed_tiles, dirs, cfg):
+def _process_tile(buildings, source, tile, allowed_tiles, dirs, cfg, show_progress=False):
     marker = dirs["done"] / f"{tile.key}.json"
     data = _read_tile_buildings(buildings, source, tile, cfg)
-    patches = _facade_segments(data, cfg)
+    patches = _facade_segments(data[data["selected"]], cfg)
     owned = patches[(patches["home_ix"] == tile.ix) & (patches["home_iy"] == tile.iy)]
     contacts, contact_ids = _contact_rows(patches, data, tile, cfg)
     exchange = _patch_exchange(
         patches, data, tile, allowed_tiles, contact_ids, cfg,
+        show_progress=show_progress,
     )
     owned_building_ids = owned["building_id"].drop_duplicates()
     lookup = data[data["node_id"].isin(owned_building_ids)][["node_id"]].copy()
@@ -432,11 +607,13 @@ def _process_tile(buildings, source, tile, allowed_tiles, dirs, cfg):
     contacts.to_parquet(dirs["contacts"] / f"{tile.key}.parquet", index=False)
     lookup.to_parquet(dirs["building_ids"] / f"{tile.key}.parquet", index=False)
     exchange.to_parquet(dirs["raw"] / f"{tile.key}.parquet", index=False)
-    marker.write_text(json.dumps({
+    status = {
         "tile": tile.key, "buildings_loaded": len(data),
         "patches_owned": len(owned), "contacts": len(contacts),
         "raw_edges": len(exchange),
-    }))
+    }
+    marker.write_text(json.dumps(status))
+    return status
 
 
 def _reduce_partitions(out, dirs, cfg):
