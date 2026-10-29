@@ -123,21 +123,6 @@ openview/
 └── pyproject.toml
 ```
 
----
-
-## Citation
-
-If you use `openview` in your research, please cite:
-
-```bibtex
-@article{swietek2025openview,
-  title   = {openview: Street- and facade-level visual exposure simulation for urban environments},
-  author  = {Swietek, Adam},
-  journal = {Journal of Open Source Software},
-  year    = {2025},
-  note    = {under review}
-}
-```
 
 ---
 
